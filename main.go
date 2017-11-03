@@ -112,11 +112,7 @@ func (e *expander) expandEnviron(decrypt bool) error {
 	// Environment variables that point to some SSM parameters.
 	var ssmVars []ssmVar
 
-	input := &ssm.GetParametersInput{
-		WithDecryption: aws.Bool(decrypt),
-	}
-
-	names := make(map[string]bool)
+	uniqNames := make(map[string]bool)
 	for _, envvar := range e.os.Environ() {
 		k, v := splitVar(envvar)
 
@@ -126,39 +122,68 @@ func (e *expander) expandEnviron(decrypt bool) error {
 		}
 
 		if parameter != nil {
-			names[*parameter] = true
+			uniqNames[*parameter] = true
 			ssmVars = append(ssmVars, ssmVar{k, *parameter})
 		}
 	}
 
-	for k := range names {
-		input.Names = append(input.Names, aws.String(k))
-	}
-
-	if len(input.Names) == 0 {
+	if len(uniqNames) == 0 {
 		// Nothing to do, no SSM parameters.
 		return nil
 	}
 
+	names := make([]string, len(uniqNames))
+	i := 0
+	for k := range uniqNames {
+		names[i] = k
+		i++
+	}
+
+	batchSize := 10
+	for i := 0; i < len(names); i += batchSize {
+		j := i + batchSize
+		if j > len(names) {
+			j = len(names)
+		}
+
+		values, err := e.getParameters(names[i:j], decrypt)
+		if err != nil {
+			return err
+		}
+
+		for _, v := range ssmVars {
+			e.os.Setenv(v.envvar, values[v.parameter])
+		}
+	}
+
+	return nil
+}
+
+func (e *expander) getParameters(names []string, decrypt bool) (map[string]string, error) {
+	values := make(map[string]string)
+
+	input := &ssm.GetParametersInput{
+		WithDecryption: aws.Bool(decrypt),
+	}
+
+	for _, n := range names {
+		input.Names = append(input.Names, aws.String(n))
+	}
+
 	resp, err := e.ssm.GetParameters(input)
 	if err != nil {
-		return err
+		return values, err
 	}
 
 	if len(resp.InvalidParameters) > 0 {
-		return newInvalidParametersError(resp)
+		return values, newInvalidParametersError(resp)
 	}
 
-	values := make(map[string]string)
 	for _, p := range resp.Parameters {
 		values[*p.Name] = *p.Value
 	}
 
-	for _, v := range ssmVars {
-		e.os.Setenv(v.envvar, values[v.parameter])
-	}
-
-	return nil
+	return values, nil
 }
 
 type invalidParametersError struct {
